@@ -76,24 +76,34 @@ if [[ "$FIRST_TIME" == "--first-time" ]]; then
   echo "==> 安装 nginx 配置"
   # 两套布局必须分开处理。Ubuntu/Debian 的主配置只 include sites-enabled/，
   # **不 include conf.d/** —— 往 conf.d 里拷文件会成功、nginx -t 也过，
-  # 但那个 server 块根本没被加载，表现是「配置明明装好了，80 端口却 404」。
-  # 所以这里按目录是否存在来分流，Debian 分支还要补一个软链。
+  # 但那个 server 块根本没被加载，表现是「配置明明装好了、端口却 404」。
+  #
+  # ⚠️ 这段刻意**不删除** /etc/nginx/sites-enabled/default，也不碰任何
+  #    已有配置。这台机器上跑着别的站点，删 default 等于把人家摘下线。
+  #    我们只新增一个文件，监听 8080，与 80 上的现有服务互不干扰。
   ssh "$HOST" bash -s <<'REMOTE'
 set -e
+[ -f /etc/nginx/nginx.conf ] || { echo "!! 这台机器上没有 nginx，先装：apt install nginx 或 dnf install nginx"; exit 1; }
+
+echo "-- 现有 nginx 站点（确认我们不覆盖它们）--"
+grep -rhE '^\s*(listen|server_name)' /etc/nginx/sites-enabled/ /etc/nginx/conf.d/ 2>/dev/null | sort -u || true
+
 if [ -d /etc/nginx/sites-available ]; then
   sudo cp /srv/wedding/deploy/nginx.conf /etc/nginx/sites-available/wedding
   sudo ln -sf /etc/nginx/sites-available/wedding /etc/nginx/sites-enabled/wedding
-  # Debian 自带的 default 站点也监听 80，会和我们的 server 抢
-  sudo rm -f /etc/nginx/sites-enabled/default
 else
   sudo cp /srv/wedding/deploy/nginx.conf /etc/nginx/conf.d/wedding-web.conf
 fi
+
+# 必须是这条：我们只在 8080 上新增，80 上一个字都不改
 sudo nginx -t
 sudo systemctl reload nginx 2>/dev/null || sudo systemctl restart nginx
+echo "-- 8080 自测 --"
+curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 5 http://127.0.0.1:8080/ || echo "(还没生成过对比页，404 是正常的)"
 REMOTE
 
   # nginx 以 www-data / nginx 身份跑，要能穿过 /srv/wedding 进到 web/。
-  # 目录若是 700，症状是首页 403/404 但文件明明在那儿。
+  # 目录若是 700，症状是 404/403 但文件明明在那儿。
   ssh "$HOST" "sudo chmod 755 /srv/wedding && sudo chmod -R a+rX /srv/wedding/web 2>/dev/null || true"
 fi
 
@@ -109,8 +119,9 @@ cat <<'EOF'
 ────────────────────────────────────────────────────────────────
 别忘了这几件脚本管不了的事：
 
-1. 阿里云控制台 → 安全组 → 放行 80 端口（入方向）。
-   另外 SSH 的 22 也要放行，否则上面这些命令根本连不上。
+1. 阿里云控制台 → 安全组 → 放行 **8080** 端口（入方向）。
+   不要动 80 —— 那上面有别的站点。SSH 的 22 已经开着（否则上面这些
+   命令根本连不上）。
 
 2. 本机把机器人停掉！两处原因叠加会出问题：
    · 飞书集群投递**不广播**，同一条消息只会发给**其中一个**长连接。
