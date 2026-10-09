@@ -31,9 +31,18 @@ ReadWritePaths=/srv/wedding
 Environment=HOME=/srv/wedding
 
 # ── 资源上限 ─────────────────────────────────────────────────────
-# 每次 query() 会拉起一个 claude 子进程。个人使用串行跑，
-# 2G 内存足够；若将来并发变多需要相应调高。
-MemoryMax=2G
+# 每次 query() 会拉起一个 claude 子进程，它和主进程在同一个 cgroup 里，
+# 所以这里的上限是「两个进程加起来」。
+#
+# ⚠️ 别凭感觉写大数。目标机器实测只有 1.6G 总内存，上面还跑着别的服务
+#    （nginx 两个站点、宝塔面板、firewalld、一堆阿里云 agent）。
+#    上限设成 2G 会允许这个服务吃掉全机内存，然后 **OOM killer 按占用
+#    挑人杀，被杀的不一定是我们** —— 可能顺手把宝塔或 nginx 干掉。
+#    1G 的意义是：超额时死的是我们自己（systemd Restart=always 会拉回来，
+#    对账逻辑会把卡片改成「服务重启了」），而不是邻居。
+MemoryMax=1G
+# 软限制：先触发回收和换页，到 1G 才真杀。给突发留一点缓冲。
+MemoryHigh=800M
 
 [Install]
 WantedBy=multi-user.target
