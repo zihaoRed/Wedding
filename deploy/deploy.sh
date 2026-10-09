@@ -80,7 +80,7 @@ if [[ "$FIRST_TIME" == "--first-time" ]]; then
   #
   # ⚠️ 这段刻意**不删除** /etc/nginx/sites-enabled/default，也不碰任何
   #    已有配置。这台机器上跑着别的站点，删 default 等于把人家摘下线。
-  #    我们只新增一个文件，监听 8080，与 80 上的现有服务互不干扰。
+  #    我们只新增一个文件，监听 8899，与 80 上的现有服务互不干扰。
   ssh "$HOST" bash -s <<'REMOTE'
 set -e
 [ -f /etc/nginx/nginx.conf ] || { echo "!! 这台机器上没有 nginx，先装：apt install nginx 或 dnf install nginx"; exit 1; }
@@ -95,11 +95,11 @@ else
   sudo cp /srv/wedding/deploy/nginx.conf /etc/nginx/conf.d/wedding-web.conf
 fi
 
-# 必须是这条：我们只在 8080 上新增，80 上一个字都不改
+# 必须是这条：我们只在 8899 上新增，80 上一个字都不改
 sudo nginx -t
 sudo systemctl reload nginx 2>/dev/null || sudo systemctl restart nginx
-echo "-- 8080 自测 --"
-curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 5 http://127.0.0.1:8080/ || echo "(还没生成过对比页，404 是正常的)"
+echo "-- 8899 自测 --"
+curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 5 http://127.0.0.1:8899/ || echo "(还没生成过对比页，404 是正常的)"
 REMOTE
 
   # nginx 以 www-data / nginx 身份跑，要能穿过 /srv/wedding 进到 web/。
@@ -119,7 +119,7 @@ cat <<'EOF'
 ────────────────────────────────────────────────────────────────
 别忘了这几件脚本管不了的事：
 
-1. 阿里云控制台 → 安全组 → 放行 **8080** 端口（入方向）。
+1. 阿里云控制台 → 安全组 → 放行 **8899** 端口（入方向）。
    不要动 80 —— 那上面有别的站点。SSH 的 22 已经开着（否则上面这些
    命令根本连不上）。
 
