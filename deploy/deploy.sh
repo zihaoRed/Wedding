@@ -69,11 +69,32 @@ if [[ "$FIRST_TIME" == "--first-time" ]]; then
   #    而且这个报错发生在第一次处理消息时，不在启动时，很容易漏。
   ssh "$HOST" "cd $REMOTE_ROOT && npm install --no-audit --no-fund"
 
-  echo "==> 安装 systemd unit 与 nginx 配置"
+  echo "==> 安装 systemd unit"
   ssh "$HOST" "sudo cp $REMOTE_ROOT/deploy/wedding-bot.service /etc/systemd/system/wedding-bot.service"
-  ssh "$HOST" "sudo cp $REMOTE_ROOT/deploy/nginx.conf /etc/nginx/conf.d/wedding-web.conf 2>/dev/null || sudo cp $REMOTE_ROOT/deploy/nginx.conf /etc/nginx/sites-available/wedding-web"
   ssh "$HOST" "sudo systemctl daemon-reload && sudo systemctl enable wedding-bot"
-  ssh "$HOST" "sudo nginx -t && sudo systemctl reload nginx || sudo systemctl restart nginx"
+
+  echo "==> 安装 nginx 配置"
+  # 两套布局必须分开处理。Ubuntu/Debian 的主配置只 include sites-enabled/，
+  # **不 include conf.d/** —— 往 conf.d 里拷文件会成功、nginx -t 也过，
+  # 但那个 server 块根本没被加载，表现是「配置明明装好了，80 端口却 404」。
+  # 所以这里按目录是否存在来分流，Debian 分支还要补一个软链。
+  ssh "$HOST" bash -s <<'REMOTE'
+set -e
+if [ -d /etc/nginx/sites-available ]; then
+  sudo cp /srv/wedding/deploy/nginx.conf /etc/nginx/sites-available/wedding
+  sudo ln -sf /etc/nginx/sites-available/wedding /etc/nginx/sites-enabled/wedding
+  # Debian 自带的 default 站点也监听 80，会和我们的 server 抢
+  sudo rm -f /etc/nginx/sites-enabled/default
+else
+  sudo cp /srv/wedding/deploy/nginx.conf /etc/nginx/conf.d/wedding-web.conf
+fi
+sudo nginx -t
+sudo systemctl reload nginx 2>/dev/null || sudo systemctl restart nginx
+REMOTE
+
+  # nginx 以 www-data / nginx 身份跑，要能穿过 /srv/wedding 进到 web/。
+  # 目录若是 700，症状是首页 403/404 但文件明明在那儿。
+  ssh "$HOST" "sudo chmod 755 /srv/wedding && sudo chmod -R a+rX /srv/wedding/web 2>/dev/null || true"
 fi
 
 echo "==> 重启服务"
