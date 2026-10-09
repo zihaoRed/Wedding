@@ -1,0 +1,24 @@
+{
+  "name": "wedding-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "备婚 Agent 助手 —— 飞书机器人 + Claude Agent SDK",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node bot/index.mjs",
+    "check": "node scripts/check.mjs",
+    "check:agent": "node scripts/check.mjs --agent",
+    "probe": "node scripts/probe.mjs",
+    "test": "node scripts/selftest.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.295",
+    "@larksuiteoapi/node-sdk": "^1.74.0",
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "sharp": "^0.34.0"
+  }
+}
