@@ -25,38 +25,52 @@ REMOTE_ROOT=/srv/wedding
 # ── 同步什么、不同步什么 ────────────────────────────────────────────
 # 排除项和 .gitignore 保持一致，外加两条本地特有的：
 #   node_modules —— 平台不同（darwin-arm64 vs linux-x64），必须在对端重装
-#   .env         —— 里面有飞书密钥，单独 scp，不走 rsync 的批量通道
-EXCLUDES=(
-  --exclude 'node_modules/'
-  --exclude '.git/'
-  --exclude '.env'
-  --exclude 'state/'
-  --exclude 'workspace/raw/'
-  --exclude 'workspace/output/'
-  --exclude 'web/'
-  --exclude '.DS_Store'
-  --exclude '*.log'
+#   .env         —— 里面有飞书密钥，单独 scp，不走批量通道
+#
+# ⚠️ 用 tar 走 ssh，不用 rsync。
+#    一开始写的是 rsync，结果在目标机上直接 `rsync: command not found`
+#    —— Alibaba Cloud Linux 4 的最小安装不带 rsync。为了一个部署脚本
+#    往生产机上装包不值得，tar 到处都有。
+#    代价：没有 --delete 语义，本地删掉的文件不会在对端跟着删。
+#    对这个项目无所谓（对端是运行环境，不是镜像）。
+TAR_EXCLUDES=(
+  --exclude './node_modules' --exclude './.git' --exclude './.env'
+  --exclude './state' --exclude './workspace/raw' --exclude './workspace/output'
+  --exclude './web' --exclude '.DS_Store' --exclude '*.log'
 )
+
+# macOS 的 bsdtar 会为每个文件带上 com.apple.provenance 扩展属性，
+# GNU tar 读到会刷一屏 "Ignoring unknown extended header keyword"。
+# 纯噪音，关掉。GNU tar 不认这个参数，所以失败就退回不带的写法。
+TAR_MAC_META=()
+if tar --no-mac-metadata -cf /dev/null --files-from /dev/null 2>/dev/null; then
+  TAR_MAC_META=(--no-mac-metadata)
+fi
 
 echo "==> 同步代码到 $HOST:$REMOTE_ROOT"
 if [[ "$FIRST_TIME" == "--first-time" ]]; then
-  ssh "$HOST" "sudo mkdir -p $REMOTE_ROOT && sudo chown \$(id -u):\$(id -g) $REMOTE_ROOT"
+  ssh "$HOST" "mkdir -p $REMOTE_ROOT"
 fi
-rsync -az --delete "${EXCLUDES[@]}" "$LOCAL_ROOT/" "$HOST:$REMOTE_ROOT/"
+tar "${TAR_MAC_META[@]}" czf - "${TAR_EXCLUDES[@]}" -C "$LOCAL_ROOT" . \
+  | ssh "$HOST" "tar xzf - -C $REMOTE_ROOT"
 
 # ── 状态与数据 ──────────────────────────────────────────────────────
-# 单独同步，且刻意不 --delete：对端可能已经有更新的数据。
+# 单独同步，且刻意只增不删。
 #
-# state/jobs.json 一定要带过去。它同时是「任务日志」和「飞书事件去重表」，
-# 本地已经有 20 条记录。如果对端从空的开始，而飞书又把 7 小时窗口内的
-# 老消息重推到新进程上，那些消息会被当成新消息重跑一遍 —— 重复花钱。
-rsync -az "$LOCAL_ROOT/state/jobs.json"        "$HOST:$REMOTE_ROOT/state/" 2>/dev/null || true
-rsync -az "$LOCAL_ROOT/state/media-index.json" "$HOST:$REMOTE_ROOT/state/" 2>/dev/null || true
+# state/jobs.json 一定要带过去。它同时是「任务日志」和「飞书事件去重表」。
+# 对端如果从空的开始，而飞书又把 7 小时窗口内的老消息重推到新进程上，
+# 那些消息会被当成新消息重跑一遍 —— 重复 Agent 回合、重复写文件、重复花钱。
+ssh "$HOST" "mkdir -p $REMOTE_ROOT/state $REMOTE_ROOT/workspace"
+for f in state/jobs.json state/media-index.json; do
+  [[ -f "$LOCAL_ROOT/$f" ]] && tar "${TAR_MAC_META[@]}" czf - -C "$LOCAL_ROOT" "$f" \
+    | ssh "$HOST" "tar xzf - -C $REMOTE_ROOT"
+done
 
 echo "==> 同步 workspace 数据（Markdown 才是真相来源）"
-ssh "$HOST" "mkdir -p $REMOTE_ROOT/workspace"
-rsync -az "$LOCAL_ROOT/workspace/data/"   "$HOST:$REMOTE_ROOT/workspace/data/"
-rsync -az "$LOCAL_ROOT/workspace/inbox/"  "$HOST:$REMOTE_ROOT/workspace/inbox/"
+for d in workspace/data workspace/inbox; do
+  [[ -d "$LOCAL_ROOT/$d" ]] && tar "${TAR_MAC_META[@]}" czf - -C "$LOCAL_ROOT" "$d" \
+    | ssh "$HOST" "tar xzf - -C $REMOTE_ROOT"
+done
 
 if [[ "$FIRST_TIME" == "--first-time" ]]; then
   echo "==> 上传 .env（含密钥，单独走，不进 rsync 的批量通道）"
