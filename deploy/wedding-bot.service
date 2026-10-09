@@ -3,6 +3,14 @@ Description=备婚 Agent 助手（飞书长连接机器人）
 After=network-online.target
 Wants=network-online.target
 
+# ⚠️ 这两行必须在 [Unit] 段。写在 [Service] 里 systemd 会直接忽略
+#    （日志里只有一行 "Unknown key name ... ignoring."，服务照常启动，
+#    所以很容易漏掉），然后默认的启动频率限制继续生效：10 秒内启动超过
+#    5 次就**放弃重启**。那意味着崩溃循环时 Restart=always 形同虚设，
+#    机器人会彻底躺平 —— 而它躺平是静默的，飞书那边只表现为「发消息没反应」。
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
 [Service]
 Type=simple
 WorkingDirectory=/srv/wedding
@@ -13,7 +21,6 @@ ExecStart=/usr/bin/node bot/index.mjs
 # 长连接断了要能自己回来
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
 
 StandardOutput=journal
 StandardError=journal
