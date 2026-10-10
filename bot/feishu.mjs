@@ -123,8 +123,19 @@ export async function sendFile(chatId, filePath) {
       file: fs.createReadStream(filePath),
     },
   }), `上传文件 ${name}`);
-  const fileKey = up.data?.file_key;
-  if (!fileKey) throw new Error(`上传 ${name} 未返回 file_key`);
+  // ⚠️ 这个接口返回的是**扁平**的 `{ file_key }`，没有 `code`/`data` 那层信封 ——
+  //    跟 message.create 的 `{ code, msg, data: { message_id } }` 不是一个形状。
+  //
+  //    这里原来写的是 `up.data.file_key`，于是**每一次上传都抛错**：xlsx 交付
+  //    从 10/9 起连续 7 次全败，一次没成功过。之所以一直没被当成代码 bug，
+  //    是因为报错写成「未返回 file_key」，读起来像飞书那边没给，而不像读错了字段。
+  //
+  //    实测过 1KB 和 2.8MB 两种大小，返回都是扁平的，所以不是「大文件才这样」。
+  //    两个形状都认，免得哪天 SDK 把信封加回来又炸一次。
+  const fileKey = up?.file_key ?? up?.data?.file_key;
+  if (!fileKey) {
+    throw new Error(`上传 ${name} 未返回 file_key。原始响应：${JSON.stringify(up).slice(0, 500)}`);
+  }
 
   unwrap(await client().im.v1.message.create({
     params: { receive_id_type: 'chat_id' },
