@@ -110,6 +110,10 @@ async function tick() {
     ok: pull.ok,
     files: pull.files,
     bytes: pull.bytes,
+    // 卡片上要说清楚「这次到底同步了什么」，光有总数看不出来。
+    // 后加的字段：机器人那边缺了也能显示，只是少一段括号。
+    added: pull.added.length,
+    changed: pull.changed.length,
     error: pull.ok ? null : (pull.stderr || `退出码 ${pull.code}`),
   };
   writeResult(payload);

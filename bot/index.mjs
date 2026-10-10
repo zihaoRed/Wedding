@@ -10,7 +10,7 @@ import { buildCard, sendCard, sendText, patchOrResend, sendFile, downloadImage }
 import { ingestImage, pruneRaw } from './media.mjs';
 import { runAgent, appendTurn, failureMessage } from './agent.mjs';
 import {
-  formatSummary, buildExportZip, bumpRequest, requestInFlight, macOnline,
+  formatSummary, buildExportZip, bumpRequest, requestInFlight, macOnline, readResult,
 } from './export.mjs';
 import { renderExportCard } from './export-card.mjs';
 
@@ -135,6 +135,49 @@ async function runExportZip(chatId, messageId) {
     renderExportCard('zip 已经发上来了，往上翻一条就是。'));
 }
 
+// 等 Mac 回执要等多久。本机轮询是 15 秒一次，拉一次几秒，所以正常 20 秒上下；
+// 给到 2 分钟是留够「Mac 刚睡醒、网慢、或者服务器正忙」的余量。
+const MAC_WAIT_MS = 2 * 60_000;
+const MAC_POLL_MS = 3_000;
+
+/**
+ * 等 Mac 把回执写回来，然后刷新卡片。
+ *
+ * ── 为什么要轮询，而不是让 Mac 反过来通知 ────────────────────────────
+ * Mac 在 NAT 后面没有公网 IP，服务器连不进去。所以只能服务器这边主动看。
+ * 回执文件就是这个用途 —— 它不是「给机器读的状态」，是「给卡片读的结果」。
+ *
+ * 没有这一步的话，卡片会永远停在「正在等它来拉」，哪怕文件其实早就同步完了：
+ * 用户按了按钮，却看不出到底成没成。
+ */
+async function waitForMac(chatId, messageId, seq) {
+  const deadline = Date.now() + MAC_WAIT_MS;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, MAC_POLL_MS));
+    const r = readResult();
+    if ((r?.seq ?? 0) < seq) continue;      // 还是上一次的回执，继续等
+
+    if (r.ok) {
+      // 总数卡片上面那行已经写了（「上次同步：刚刚（53 个文件）」），
+      // 这里只说这次变了什么。added/changed 是后加的字段，老回执里没有。
+      const detail = (r.added || r.changed)
+        ? `新增 ${r.added ?? 0} 个，更新 ${r.changed ?? 0} 个`
+        : '内容没有变化';
+      logger.info(`[card] Mac 回执到了 seq=${r.seq}，${r.files} 个文件`);
+      await patchOrResend(chatId, messageId, renderExportCard(`✓ 同步完成：${detail}`));
+    } else {
+      logger.warn(`[card] Mac 回执 seq=${r.seq} 是失败：${r.error}`);
+      await patchOrResend(chatId, messageId,
+        renderExportCard(`✗ 同步失败：${r.error ?? '原因不明'}\n\nMac 那台机器的终端里有完整日志。`));
+    }
+    return;
+  }
+
+  logger.warn(`[card] 等了 ${MAC_WAIT_MS / 1000}s 没等到 Mac 回执（seq=${seq}）`);
+  await patchOrResend(chatId, messageId, renderExportCard(
+    'Mac 一直没回话。确认它那台机器上 `npm run watch` 还在跑。'));
+}
+
 /**
  * 卡片按钮回调。返回值会被 SDK base64 后送回飞书，所以可以当场弹个提示。
  * 这个函数**必须尽快返回** —— 打包上传这些慢活全部丢到后台去。
@@ -171,9 +214,12 @@ function onCardAction(data) {
       if (requestInFlight()) {
         return { toast: { type: 'info', content: '已经通知过了，Mac 正在处理' } };
       }
-      bumpRequest(openId);
+      const seq = bumpRequest(openId);
       patchOrResend(chatId, messageId, renderExportCard())
         .catch((err) => logger.warn('[card] 更新卡片失败：', err.message));
+      // 丢到后台去等，别阻塞这个必须尽快返回的回调
+      waitForMac(chatId, messageId, seq)
+        .catch((err) => logger.warn('[card] 等回执异常：', err.message));
       return { toast: { type: 'success', content: '已通知你的 Mac' } };
     }
 
