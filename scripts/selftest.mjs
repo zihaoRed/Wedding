@@ -14,7 +14,8 @@ import { renderXlsx, renderWeb } from '../bot/render.mjs';
 import { betterDirection, comparableNumber, computeEmphasis } from '../bot/emphasis.mjs';
 import { JobQueue } from '../bot/queue.mjs';
 import { writeGuard } from '../bot/agent.mjs';
-import { createRenderServer, renderToolDefinition } from '../bot/tools.mjs';
+import { createRenderServer, renderToolDefinition, fieldHealthToolDefinition } from '../bot/tools.mjs';
+import { hasValue, sparseColumn, dropEmptyColumns, buildReport, readCorpus } from '../bot/fieldhealth.mjs';
 import ExcelJS from 'exceljs';
 
 // ── 沙箱：自检绝不能碰真实的 workspace/ 和 state/ ──────────────────
@@ -279,7 +280,9 @@ section('高亮 · 方向与取值');
   // 词表会漂移：Agent 改个列名就绕过了。所以拿 spec 原文来对 ——
   // 以后往 §4 里加字段而忘了改 emphasis.mjs，这里会红。
   const specText = fs.readFileSync(path.join(paths.root, 'spec', 'AGENT_SPEC.md'), 'utf8');
-  const sec4 = (specText.split(/^## 4\./m)[1] ?? '').split(/^## 5\./m)[0];
+  // 只取「字段清单」那一段：§4 抬头的说明文字里也会出现反引号（工具名、路径），
+  // 那些不是字段名，混进来会让这条测试变成「别在 §4 写说明」。
+  const sec4 = ((specText.split(/^## 4\./m)[1] ?? '').split(/^## 5\./m)[0]).split('通用字段')[1] ?? '';
   const ENUMS = ['待对比', '已定', '已淘汰', '待购', '已购', '已到货'];
   const specFields = [...new Set(sec4.split('\n').flatMap((line) => {
     const spans = [...line.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
@@ -548,6 +551,177 @@ section('MCP 渲染工具');
 
   const webArt = captured.find((c) => c.kind === 'web');
   ok('网页含表格内容', fs.readFileSync(webArt.file, 'utf8').includes('B家'));
+
+  for (const c of captured) fs.rmSync(c.file, { force: true });
+}
+
+// ── 8. 字段体检 ────────────────────────────────────────────────────
+section('字段体检（空列退出与扩充候选）');
+{
+  // 判据：hasValue 与 emphasis 的弃权判断是**相反**的两件事，不能互相复用。
+  // 「底片不赠送」对配色是「不能拿来比大小」，对覆盖率却是一个真值。
+  ok('「未知（图内未提门票、交通、餐食）」算没值', !hasValue('未知（图内未提门票、交通、餐食）'));
+  ok('空串 / null / undefined 算没值', !hasValue('') && !hasValue(null) && !hasValue(undefined));
+  ok('「底片不赠送」算**有值**（这家明确说了不给）', hasValue('底片不赠送'));
+  ok('同一个值在配色那边必须弃权 —— 两边判断正好相反',
+    comparableNumber('底片不赠送', '底片') === null);
+  ok('一句给了值就算有值（另半句说明「图上没列」不影响）',
+    hasValue('内景+外景（图内只列热门风格推荐：内景—光影、极简；外景—法式、草坪'));
+  ok('整格只有「未知 / 图上未写」就是没值', !hasValue('未知；图上未写'));
+
+  // 空列判据：有值不足三分之一。用比例不用绝对值 —— 三家对比不能因为「只有 2 家写了」被砍。
+  ok('0/3 是空列', sparseColumn(0, 3));
+  ok('2/3 不是空列', !sparseColumn(2, 3));
+  ok('1/4 是空列', sparseColumn(1, 4));
+  ok('6/20 是空列', sparseColumn(6, 20));
+  ok('7/20 不是空列', !sparseColumn(7, 20));
+  ok('0/2 是空列', sparseColumn(0, 2));
+
+  const wide = [
+    ['商家', '报价', '定金', '尾款节点'],
+    ['A家', '8999', '1000', '未知'],
+    ['B家', '9999', '未知', '未知'],
+    ['C家', '未知', '未知', '未知'],
+    ['D家', '未知', '未知', '未知'],
+  ];
+  const cut = dropEmptyColumns(wide);
+  ok('空列被拿掉、有值列留下', cut.dropped.join('、') === '定金、尾款节点', JSON.stringify(cut.dropped));
+  ok('第 0 列（商家名）永不丢', cut.rows[0][0] === '商家' && cut.rows.every((r) => r.length === 2));
+  ok('原 rows 不动（两个格式要渲染同一份数据）', wide[0].length === 4);
+  ok('keep 能豁免用户点名要回的列',
+    dropEmptyColumns(wide, { keep: ['定金'] }).dropped.join('、') === '尾款节点');
+  const nothingLeft = [['商家', 'A', 'B'], ['X家', '未知', '未知'], ['Y家', '未知', '未知']];
+  const untouched = dropEmptyColumns(nothingLeft);
+  ok('只剩商家名时不丢（宁可原样返回，也不交空表）',
+    untouched.dropped.length === 0 && untouched.rows[0].length === 3);
+
+  ok('没有数据时返回人话、不抛异常', /先让用户/.test(buildReport([], { categories: ['化妆师'] })));
+
+  // 定标：拿真实语料里的原文片段搭四份 fixture，把「我眼看它准」变成断言。
+  const dir = path.join(paths.data, '婚纱照');
+  const write = (name, text) => fs.writeFileSync(path.join(dir, name), text);
+  write('自检A家.md', `---
+id: a
+商家: A家婚纱摄影
+报价: 3999
+定金: 未知（图内未提）
+需确认: [是否含婚礼当天跟妆]
+---
+## 原始信息
+- 城市与拍摄天数：珠海一天拍摄
+- **海报**：180*80cm 迎宾海报一幅
+- 预约赠送：产品全国包邮
+- 全程无任何隐形消费
+- 交通、餐食、门票均未提
+`);
+  write('自检B家.md', `---
+id: b
+商家: B家婚纱摄影
+报价: 5999
+定金: 1000
+需确认: [尾款什么时候付]
+---
+## 原始信息
+- 拍摄城市：珠海
+- 赠送 180*80cm 迎宾海报一幅
+- 产品免费包邮到家（港澳台除外）
+- 定金 1000 元（不可退）
+- 交通、餐食、门票均未提
+`);
+  write('自检C家.md', `---
+id: c
+商家: C家婚纱摄影
+报价: 7999
+定金: 未知
+需确认: [加片单价多少]
+---
+## 原始信息
+- 拍摄城市：珠海、澳门
+- 海报：150*90cm 迎宾海报一幅
+- 赠送产品全国包邮
+- 全部赠送，底片保底 120 张
+- 交通、餐食、门票、车费未知（图上未提）
+`);
+  write('自检D家.md', `---
+id: d
+商家: D家婚纱摄影
+报价: 8999
+定金: 未知
+需确认: [有效期是否 5 年]
+---
+## 原始信息
+- 全程无任何隐形消费，不满意可重拍
+- 拍一套看一套
+- 含相册两本、相框三个
+- 报价有效期：5 年内有效
+- 餐食未知（图上未写）
+`);
+
+  const report = buildReport(readCorpus(paths.data, ['婚纱照']), { categories: ['婚纱照'] });
+  const lineOf = (prefix) => report.split('\n').find((l) => l.startsWith(prefix)) ?? '';
+  const star = lineOf('正文里有值');
+  const blank = lineOf('只是反复记成');
+  const emptyLine = lineOf('空列');
+
+  ok('★候选里有点名的三项（城市 / 海报 / 包邮）',
+    /城市/.test(star) && /海报/.test(star) && /包邮/.test(star), star);
+  ok('已收录的字段绝不作为「新候选」出现',
+    !/相册|底片|定金|有效期|跟妆|报价/.test(star), star);
+  // 只看候选**词**：括号里的样例是原文，出现「迎宾」这类同义说法是应该的
+  ok('实测抓到的噪声词不进候选栏',
+    !/★(?:迎宾|证件照|隐形消|拍一套|程无任何)/.test(star) && !/隐形消|拍一套/.test(report), star);
+  ok('只被记成「没人写」的项落进空白栏、不进候选栏',
+    /门票/.test(blank) && /餐食/.test(blank) && !/门票|餐食/.test(star),
+    `候选=${star} / 空白=${blank}`);
+  ok('报告指出哪些列空得该退出表', /定金 1\/4/.test(emptyLine), emptyLine);
+
+  // 工具契约：0 份数据、非法品类都不能抛（一次异常会让整轮对话失败）
+  const health = fieldHealthToolDefinition({ dataDir: paths.data });
+  const empty = await health.handler({ category: '化妆师' });
+  ok('0 份数据的品类返回提示文本而不是抛异常',
+    empty.content[0].type === 'text' && /还没有可体检的数据/.test(empty.content[0].text), empty.content[0].text);
+  const bad = await health.handler({ category: '不存在的品类' });
+  ok('非法品类给出可选清单', /婚纱照/.test(bad.content[0].text) && /没有/.test(bad.content[0].text));
+  const all = await health.handler({ category: '全部' });
+  ok('「全部」能跑通并带上婚纱照', /婚纱照 · 4 份/.test(all.content[0].text), all.content[0].text.slice(0, 60));
+
+  for (const f of fs.readdirSync(dir)) fs.rmSync(path.join(dir, f), { force: true });
+}
+
+// ── 9. 渲染时丢掉空列 ──────────────────────────────────────────────
+section('render_output 丢空列');
+{
+  const captured = [];
+  const tool = renderToolDefinition({ onArtifact: (a) => captured.push(...a) });
+  const res = await tool.handler({
+    title: '自检-空列退出',
+    category: '婚纱照',
+    rows: [
+      ['商家', '报价', '定金', '海报', '尾款节点'],
+      ['A家', 8999, 1000, '有', '未知'],
+      ['B家', 9999, '未知', '未知', '未知'],
+      ['C家', '未知', '未知', '有', '未知'],
+      ['D家', '未知', '未知', '有', '未知'],
+    ],
+  });
+  ok('返回值里说清拿掉了哪几列',
+    /定金/.test(res.content[0].text) && /尾款节点/.test(res.content[0].text), res.content[0].text);
+
+  const xlsxArt = captured.find((c) => c.kind === 'xlsx');
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(xlsxArt.file);
+  const ws = wb.worksheets[0];
+  ok('xlsx 里那两列真的没了（3 列：商家/报价/海报）',
+    ws.columnCount === 3 && ws.getRow(1).values[3] === '海报', String(ws.columnCount));
+
+  // 断言必须切开 tbody：行内 <style> 里有 `td[data-emph=best]` 字样，
+  // 整页 includes('data-emph') 永远为真（上次就在这里踩过）。
+  const html = fs.readFileSync(captured.find((c) => c.kind === 'web').file, 'utf8');
+  const body = html.slice(html.indexOf('<tbody>'), html.indexOf('</tbody>'));
+  const thead = html.slice(html.indexOf('<thead>'), html.indexOf('</thead>'));
+  // 数 </th> 而不是 <th：`<thead>` 本身就以 `<th` 开头，会多数一个
+  ok('网页与 xlsx 一致：表头同样是 3 列', (thead.match(/<\/th>/g) || []).length === 3);
+  ok('网页正文里没有那两列', !/定金|尾款节点/.test(body));
 
   for (const c of captured) fs.rmSync(c.file, { force: true });
 }

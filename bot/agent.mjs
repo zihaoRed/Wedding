@@ -181,7 +181,7 @@ export async function runAgent({ job, mediaPaths = [], mediaNotes = [], onArtifa
         model: config.anthropic.model,
         systemPrompt: { type: 'preset', preset: 'claude_code', append: spec },
         permissionMode: 'dontAsk',            // 清单外的调用直接拒绝，绝不挂起等人批准
-        allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'mcp__wedding__render_output'],
+        allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'mcp__wedding__render_output', 'mcp__wedding__field_health'],
         disallowedTools: ['Bash', 'WebFetch', 'WebSearch', 'Task', 'NotebookEdit'],
         settingSources: [],                   // 硬边界：不加载任何文件系统设置
         mcpServers: { wedding: createRenderServer({ onArtifact }) },
