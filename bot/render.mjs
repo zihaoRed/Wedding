@@ -114,6 +114,15 @@ export function renderWeb(rows, { title, subtitle = '', outDir = paths.web }) {
           : `<td${numAttr(r[i])}${emphAttr(b + 1, i)}>${td(r[i])}</td>`)).join('') + '</tr>').join('\n');
 
   const dense = names.length >= 4 ? ' dense' : '';
+  // 字段多到手机放不下时（真实数据里出现过 20 家 × 14 字段），table-layout:fixed +
+  // width:100% 会把每列压到两三个字宽、**一个字一行** —— 那不是版式，是坏掉，
+  // 而且这时候上多少高亮都看不见。给表格一个下限宽度，让上面那个 .scroller 真的
+  // 有东西可滚（原来它永远滚不动，因为表格永远不超过容器宽）。
+  //
+  // 阈值定在 7 列而不是更低：6 家对比是 7 列，在 390px 上挤但读得下来，
+  // 不该被推去横滑。再窄就只剩一两个字一行了。
+  const colCount = (flip ? names.length : fields.length) + 1;
+  const minW = colCount > 7 ? ` style="min-width:${colCount * (dense ? 58 : 88)}px"` : '';
   const stamp = new Date().toLocaleString('zh-CN', { hour12: false });
 
   // 高亮与图例色块的颜色全部来自 EMPH_COLORS，一处定义两处用。
@@ -219,7 +228,7 @@ export function renderWeb(rows, { title, subtitle = '', outDir = paths.web }) {
     : `共 ${body.length} 条`}</p>
 ${legend}
 <div class="wrap"><div class="scroller">
-<table class="${flip ? 'flip' : ''}${dense}">
+<table class="${flip ? 'flip' : ''}${dense}"${minW}>
 <thead>${head}</thead>
 <tbody>
 ${trs}

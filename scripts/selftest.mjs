@@ -206,6 +206,22 @@ section('渲染产物');
   ok('非转置路径也标了高亮', /data-emph="best"/.test(cells2) && /data-emph="worst"/.test(cells2));
   ok('第一列（商家名）永不参与比较', !/<th class="corner"[^>]*data-emph/.test(cells2));
 
+  // 字段特别多的时候必须能横滑。真实数据里出现过 20 家 × 14 字段，那种表格
+  // 在 390px 上被压成**一个字一行** —— 那时候上多少高亮都看不见。
+  const wide = [
+    ['商家', ...Array.from({ length: 14 }, (_, i) => `字段${i}`)],
+    ...Array.from({ length: 20 }, (_, r) => [`商家${r}`, ...Array.from({ length: 14 }, () => 100 + r)]),
+  ];
+  const htmlW = fs.readFileSync(renderWeb(wide, { title: '自检-宽表' }), 'utf8');
+  ok('宽表给出下限宽度（宁可横滑，也不能一个字一行）',
+    /<table class="[^"]*" style="min-width:\d+px"/.test(htmlW), (htmlW.match(/<table[^>]*>/) || [])[0]);
+
+  // 但 6 家对比（转置后 7 列）在手机上挤是挤、读得下来，不该被推去横滑
+  const sixFit = [['商家', '报价', '底片', '精修张数', '服装套数', '拍摄天数', '额外费用', '定金'],
+    ...Array.from({ length: 6 }, (_, i) => [`商家${i}`, 2999 + i, 180, 30 + i, 5, 1, '无', 1000])];
+  ok('放得下就不给下限宽度（6 家对比仍然不用左右滑）',
+    !/<table[^>]*min-width/.test(fs.readFileSync(renderWeb(sixFit, { title: '自检-六家' }), 'utf8')));
+
   // 2 家对比：只标绿，不标红
   const two = [['商家', '报价'], ['A家', 2999], ['B家', 3288]];
   const web3 = renderWeb(two, { title: '自检-两家对比' });
