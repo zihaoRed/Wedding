@@ -44,12 +44,20 @@ export function buildCard({ title, template = 'blue', markdown = '', buttons = [
   if (body) els.push({ tag: 'markdown', content: body, text_size: 'normal_v2' });
   els.push(...elements);
   for (const b of buttons) {
+    // 两种按钮：
+    //   · 给了 url   → open_url，直接在浏览器里打开
+    //   · 给了 value → callback，点击会作为 card.action.trigger 事件走长连接回来
+    // 只传一个字段的话飞书会拒收整张卡片，所以这里必须二选一、不能都塞。
+    const behavior = b.value
+      ? { type: 'callback', value: b.value }
+      : { type: 'open_url', default_url: b.url };
+
     els.push({
       tag: 'button',
       text: { tag: 'plain_text', content: b.label },
       type: b.type || 'default',
       width: 'default',
-      behaviors: [{ type: 'open_url', default_url: b.url }],
+      behaviors: [behavior],
     });
   }
 
@@ -105,6 +113,7 @@ export async function patchOrResend(chatId, messageId, card) {
 const FILE_TYPE = {
   '.xlsx': 'xls',
   '.xls': 'xls',
+  '.zip': 'stream',   // 飞书没有专门的 zip 类型，stream 就是通用二进制
   '.pdf': 'pdf',
   '.docx': 'doc',
   '.pptx': 'ppt',
@@ -123,6 +132,7 @@ export async function sendFile(chatId, filePath) {
       file: fs.createReadStream(filePath),
     },
   }), `上传文件 ${name}`);
+
   // ⚠️ 这个接口返回的是**扁平**的 `{ file_key }`，没有 `code`/`data` 那层信封 ——
   //    跟 message.create 的 `{ code, msg, data: { message_id } }` 不是一个形状。
   //

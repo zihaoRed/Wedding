@@ -12,7 +12,9 @@
     "check": "node scripts/check.mjs",
     "check:agent": "node scripts/check.mjs --agent",
     "probe": "node scripts/probe.mjs",
-    "test": "node scripts/selftest.mjs"
+    "test": "node scripts/selftest.mjs",
+    "pull": "node scripts/pull.mjs",
+    "watch": "node scripts/watch.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.295",

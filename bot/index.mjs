@@ -9,6 +9,10 @@ import { parseMessage, isAllowed } from './events.mjs';
 import { buildCard, sendCard, sendText, patchOrResend, sendFile, downloadImage } from './feishu.mjs';
 import { ingestImage, pruneRaw } from './media.mjs';
 import { runAgent, appendTurn, failureMessage } from './agent.mjs';
+import {
+  formatSummary, buildExportZip, bumpRequest, requestInFlight, macOnline,
+} from './export.mjs';
+import { renderExportCard } from './export-card.mjs';
 
 ensureDirs();
 validateConfig();
@@ -71,9 +75,119 @@ function handleCommand(cmd, job) {
       try { fs.unlinkSync(path.join(paths.recentChats, `${job.chatId}.jsonl`)); } catch { /* 没有就没有 */ }
       return '已清空短期对话记忆。你的 data/ 数据完全不受影响。';
     }
+    // 返回对象而不是字符串：这张卡片要按 Mac 在不在线决定给哪些按钮，
+    // 而判断在线与否要读文件。放在队列 worker 里做，避免占用事件回调那 3 秒。
+    case '/导出':
+    case '/export':
+      return { action: 'export' };
     default:
       return null;
   }
+}
+
+// ── 导出：把数据弄回本地 ────────────────────────────────────────────
+// 两条路，同一份内容清单（见 bot/export.mjs）：
+//   同步 → 服务器盖个 seq，Mac 上的 watcher 轮询到之后自己拉（scripts/watch.mjs）
+//   下载 → 服务器打包成 zip 传上来，人在外面用手机也能拿到
+//
+// ⚠️ 按钮点击只能落在**服务器**上。你的 Mac 没有公网 IP，外网连不进去，
+//    所以「同步」这条路必须由 Mac 主动来问 —— 这就是下面 seq 机制存在的原因。
+
+const CLICK_TTL_MS = 60_000;
+
+// 卡片回调在这条（经典）分发路径上**没有**内置去重，飞书若重复投递就会重复执行。
+// 按「卡片 + 人 + 按钮」记一小段时间，双击和重投都吸收掉。
+const recentClicks = new Map();
+
+/** 卡片回调的权限判断。比消息那条更严：转出去的卡片谁都能点。 */
+function cardAllowed(chatId, openId) {
+  const { users, chats } = config.access;
+  if (users.length && !users.includes(openId)) return false;
+  if (chats.length && !chats.includes(chatId)) return false;
+  return true;
+}
+
+const sendExportCard = (chatId) => sendCard(chatId, renderExportCard());
+
+/** 打包并上传。会先改卡片说「在打包」，免得看着像卡住了。 */
+async function runExportZip(chatId, messageId) {
+  let built;
+  try {
+    built = buildExportZip();
+  } catch (err) {
+    logger.error('[export] 打包失败：', err.message);
+    await patchOrResend(chatId, messageId, renderExportCard(`打包失败：${err.message}`));
+    return;
+  }
+
+  await patchOrResend(chatId, messageId,
+    renderExportCard(`已打包 ${formatSummary(built.summary)}，正在上传…`));
+
+  try {
+    await sendFile(chatId, built.file);
+  } catch (err) {
+    logger.error('[export] 上传失败：', err.message);
+    await patchOrResend(chatId, messageId, renderExportCard(`上传失败：${err.message}`));
+    return;
+  }
+
+  await patchOrResend(chatId, messageId,
+    renderExportCard('zip 已经发上来了，往上翻一条就是。'));
+}
+
+/**
+ * 卡片按钮回调。返回值会被 SDK base64 后送回飞书，所以可以当场弹个提示。
+ * 这个函数**必须尽快返回** —— 打包上传这些慢活全部丢到后台去。
+ */
+function onCardAction(data) {
+  try {
+    const act = data?.action?.value?.act;
+    const chatId = data?.context?.open_chat_id;
+    const messageId = data?.context?.open_message_id;
+    const openId = data?.operator?.open_id;
+
+    if (!act || !chatId) return undefined;
+    if (!cardAllowed(chatId, openId)) {
+      logger.warn(`[card] 忽略未授权的点击 act=${act} chat=${chatId}`);
+      return undefined;
+    }
+
+    const key = `${messageId}:${openId}:${act}`;
+    const now = Date.now();
+    for (const [k, t] of recentClicks) if (now - t > CLICK_TTL_MS) recentClicks.delete(k);
+    if (recentClicks.has(key)) {
+      logger.info(`[card] 重复点击，已忽略 act=${act}`);
+      return { toast: { type: 'info', content: '这次点击已经收到了' } };
+    }
+    recentClicks.set(key, now);
+
+    logger.info(`[card] 点击 act=${act} chat=${chatId}`);
+
+    if (act === 'export_mac') {
+      if (!macOnline()) {
+        return { toast: { type: 'error', content: '你的 Mac 现在不在线，改用下载吧' } };
+      }
+      // 已经有一个请求在等着就不再盖新戳 —— 否则 Mac 会重复拉一遍
+      if (requestInFlight()) {
+        return { toast: { type: 'info', content: '已经通知过了，Mac 正在处理' } };
+      }
+      bumpRequest(openId);
+      patchOrResend(chatId, messageId, renderExportCard())
+        .catch((err) => logger.warn('[card] 更新卡片失败：', err.message));
+      return { toast: { type: 'success', content: '已通知你的 Mac' } };
+    }
+
+    if (act === 'export_zip') {
+      patchOrResend(chatId, messageId, renderExportCard('正在打包…'))
+        .catch((err) => logger.warn('[card] 更新卡片失败：', err.message));
+      runExportZip(chatId, messageId)
+        .catch((err) => logger.error('[export] 打包/上传异常：', err));
+      return { toast: { type: 'info', content: '正在打包…' } };
+    }
+  } catch (err) {
+    logger.error('[card] 回调处理异常：', err);
+  }
+  return undefined;
 }
 
 // ── 队列：真正干活的地方 ───────────────────────────────────────────
@@ -95,7 +209,8 @@ const queue = new JobQueue({
 async function runJob(job, { signal }) {
   // 命令类任务不走 Agent，直接回。放在队列里是为了不阻塞事件回调。
   if (job.kind === 'command') {
-    await sendText(job.chatId, job.commandReply);
+    if (job.commandAction === 'export') await sendExportCard(job.chatId);
+    else await sendText(job.chatId, job.commandReply);
     return;
   }
 
@@ -185,6 +300,16 @@ async function runJob(job, { signal }) {
   logger.info(`[job] 完成 event=${job.eventId} 用时=${elapsed}s 轮次=${res.turns} 花费=$${res.costUsd.toFixed(4)}`);
 }
 
+// 这几个词整句匹配时直接当 /导出 处理。不走 Agent 的原因：走 Agent 要花钱、
+// 要排队、还慢，而「导出」这种词模型完全可能理解成别的意思（比如导出成表格）。
+// 只做**整句**精确匹配，所以「把婚纱照导出成表格」不会误伤，照旧交给 Agent。
+const EXPORT_WORDS = new Map([
+  ['导出', '/导出'],
+  ['导出数据', '/导出'],
+  ['下载数据', '/导出'],
+  ['同步数据', '/导出'],
+]);
+
 // ── 事件入口：只做去重 + 入队，必须立刻 return ──────────────────────
 // 飞书要求 3 秒内处理完成，超时或抛异常都会触发重推
 // （15s / 5min / 1h / 6h，最长约 7 小时窗口）。所以这里绝不能有网络 I/O ——
@@ -208,12 +333,19 @@ function onEvent(data) {
     const text = parsed.text || '';
 
     // 命令类消息立刻处理，不进队列（否则要排在长任务后面）
-    if (text.startsWith('/')) {
-      const reply = handleCommand(text.split(/\s+/)[0], { chatId: parsed.chatId });
+    const cmd = text.startsWith('/')
+      ? text.split(/\s+/)[0]
+      : EXPORT_WORDS.get(text.trim().replace(/^(?:@\S+\s*)+/, ''));
+
+    if (cmd) {
+      const reply = handleCommand(cmd, { chatId: parsed.chatId });
       if (reply) {
         queue.enqueue({
           eventId, chatId: parsed.chatId, messageId: parsed.messageId,
-          images: [], text: '', kind: 'command', commandReply: reply,
+          images: [], text: '',
+          kind: 'command',
+          commandReply: typeof reply === 'string' ? reply : null,
+          commandAction: typeof reply === 'string' ? null : reply.action,
         });
         return;
       }
@@ -249,6 +381,10 @@ const wsClient = new Lark.WSClient({
 
 const dispatcher = new Lark.EventDispatcher({}).register({
   'im.message.receive_v1': (data) => { onEvent(data); },
+  // 卡片按钮点击。注册键就是事件类型字符串 —— EventDispatcher.invoke() 是
+  // 拿 data.header.event_type 去 handles 里查的，跟消息那条同一条路径。
+  // 长连接下 WSClient 用 needCheck:false 调用，所以不需要 verification token。
+  'card.action.trigger': (data) => onCardAction(data),
 });
 
 await queue.reconcile();

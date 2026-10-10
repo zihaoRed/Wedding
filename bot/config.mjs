@@ -1,6 +1,7 @@
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 import dotenv from 'dotenv';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -41,6 +42,23 @@ export const config = {
   },
   publicBaseUrl: (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, ''),
   heartbeatFile: process.env.HEARTBEAT_FILE || path.join(ROOT, 'state', 'heartbeat'),
+
+  // 「把数据弄回本地」这件事跨越两台机器，配置必须两边都能读到 ——
+  // 所以统一放在这里，由 bot/ 和 scripts/ 共同 import。
+  export: {
+    // 服务器地址。本地的 watch/pull 用它连上去；机器人自己不用。
+    host: process.env.DEPLOY_HOST || '',
+    remoteRoot: process.env.DEPLOY_ROOT || '/srv/wedding',
+    // 本地的落地目录
+    dir: process.env.EXPORT_DIR || path.join(os.homedir(), 'wedding-export'),
+    // 本地 watcher 多久问一次服务器
+    pollMs: num(process.env.EXPORT_POLL_MS, 15_000),
+    // 多久没收到 Mac 报活就算它离线。给足冗余：网络抖一下不该让卡片
+    // 谎报「Mac 不在线」，那会把你引到多余的下载上。
+    macAliveMs: num(process.env.EXPORT_MAC_ALIVE_MS, 90_000),
+    // 服务器上保留几个导出包（给飞书下载用的）
+    keep: num(process.env.EXPORT_KEEP, 2),
+  },
 };
 
 export const paths = {
