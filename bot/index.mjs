@@ -3,14 +3,18 @@ import path from 'node:path';
 import * as Lark from '@larksuiteoapi/node-sdk';
 
 import { config, paths, ensureDirs, validateConfig } from './config.mjs';
-import { acquireLock, touchHeartbeat, logger, readJson, writeJsonAtomic } from './store.mjs';
+import {
+  acquireLock, touchHeartbeat, logger, readJson, writeJsonAtomic,
+  recentLines, recentErrors, logBuffered,
+} from './store.mjs';
 import { JobQueue, statusLabel } from './queue.mjs';
 import { parseMessage, isAllowed } from './events.mjs';
-import { buildCard, sendCard, sendText, patchOrResend, sendFile, downloadImage } from './feishu.mjs';
+import { buildCard, sendCard, patchOrResend, sendFile, downloadImage } from './feishu.mjs';
 import { ingestImage, pruneRaw } from './media.mjs';
 import { runAgent, appendTurn, failureMessage } from './agent.mjs';
 import {
   formatSummary, buildExportZip, bumpRequest, requestInFlight, macOnline, readResult,
+  macAliveAge, humanAge,
 } from './export.mjs';
 import { renderExportCard } from './export-card.mjs';
 
@@ -50,16 +54,48 @@ function takePending(chatId) {
 
 // ── 命令（不经过 Agent，立刻回）─────────────────────────────────────
 
+/** 进程跑了多久：「3 小时 12 分」。humanAge 说的是「多久以前」，用在这里反着。 */
+function fmtUptime(sec) {
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d) return `${d} 天 ${h} 小时`;
+  if (h) return `${h} 小时 ${m} 分`;
+  if (m) return `${m} 分钟`;
+  return '不到 1 分钟';
+}
+
 function handleCommand(cmd, job) {
   switch (cmd) {
     case '/stop': {
       const ok = queue.cancel(job.chatId);
       return ok ? '已请求中断当前任务。' : '当前没有正在处理的任务。';
     }
+    // 一个给中文输入法、一个给肌肉记忆，是同一个东西。
+    case '/状态':
     case '/status': {
       const running = queue.runningJob;
-      const lines = [`排队中/进行中：${queue.depth} 个任务`];
-      if (running) lines.push(`正在处理：${running.eventId}`);
+      const lines = [`服务：已运行 ${fmtUptime(process.uptime())}（pid ${process.pid}）`];
+      lines.push(`队列：${queue.depth} 个任务${running ? `，正在处理 ${running.eventId}` : '，空闲'}`);
+
+      // Mac 在不在线决定导出卡片上给不给「同步到 Mac」这个按钮。
+      // 「按钮怎么没了」是被问过的，所以这里直接把原因摆出来。
+      // 没报活过时 humanAge 给的是「从未」，不能硬拼成「最后报活 从未」。
+      const age = macAliveAge();
+      if (macOnline()) lines.push(`Mac：在线（${humanAge(age)}报活）`);
+      else if (!Number.isFinite(age)) lines.push('Mac：不在线（从未报活过 —— 那台机器上 `npm run watch` 没跑起来）');
+      else lines.push(`Mac：不在线（最后报活 ${humanAge(age)}）`);
+
+      const r = readResult();
+      if (r?.at) {
+        const what = r.ok
+          ? `${r.files} 个文件${r.added || r.changed ? `（新增 ${r.added ?? 0}，更新 ${r.changed ?? 0}）` : ''}`
+          : `失败 —— ${r.error ?? '原因不明'}`;
+        lines.push(`上次同步：${humanAge(Date.now() - r.at)}（${what}）`);
+      } else {
+        lines.push('上次同步：还没有过');
+      }
+
       lines.push(`模型：${config.anthropic.model}`);
       lines.push(`单次上限：$${config.run.maxBudgetUsd} / ${config.run.maxTurns} 轮`);
       const saved = readJson(paths.journal, []);
@@ -68,6 +104,35 @@ function handleCommand(cmd, job) {
         lines.push('最近任务：');
         for (const j of recent) lines.push(`· ${statusLabel(j.status)} — ${(j.text || '').slice(0, 24) || '(仅附件)'}`);
       }
+      return lines.join('\n');
+    }
+    // 只读的运维查询：出问题时不用 ssh 上来敲 journalctl。
+    // ⚠️ 两段日志分开说清楚，因为它们回答的是不同问题：
+    //    错误那段落盘、跨重启还在（「出过什么错」）；
+    //    尾部那段只在内存里（「刚才在干嘛」），重启就没了。
+    case '/日志':
+    case '/log': {
+      // 单行可能很长（比如某次把整个 SDK 响应打了出来），一行就能吃掉整张卡片。
+      const clip = (l) => (l.length > 300 ? `${l.slice(0, 300)}…（截断）` : l);
+      // 用代码块而不是「· 」列表：日志是等宽的，行首时间戳对齐了才扫得动。
+      const block = (arr) => ['```', ...arr.map(clip), '```'];
+
+      const errs = recentErrors(12);
+      const lines = errs.length
+        ? [`**最近的错误**（${errs.length} 条，跨重启保留）：`, ...block(errs)]
+        : ['最近没有报错。'];
+
+      const tail = recentLines(8);
+      lines.push('');
+      if (tail.length) {
+        lines.push(`**最近日志**（内存里共 ${logBuffered()} 行）：`);
+        lines.push(...block(tail));
+      } else {
+        lines.push('最近日志：（刚重启，还没有新的）');
+      }
+
+      lines.push('');
+      lines.push('完整历史在服务器上：`journalctl -u wedding-bot -n 200`');
       return lines.join('\n');
     }
     case '/重置':
@@ -256,7 +321,9 @@ async function runJob(job, { signal }) {
   // 命令类任务不走 Agent，直接回。放在队列里是为了不阻塞事件回调。
   if (job.kind === 'command') {
     if (job.commandAction === 'export') await sendExportCard(job.chatId);
-    else await sendText(job.chatId, job.commandReply);
+    // 用卡片而不是纯文本：纯文本不认 markdown，/日志 里的代码块和反引号
+    // 会原样露出来。机器人别的回复本来就是卡片，这样也一致。
+    else await sendCard(job.chatId, replyCard(job.commandReply));
     return;
   }
 
@@ -384,6 +451,9 @@ function onEvent(data) {
       : EXPORT_WORDS.get(text.trim().replace(/^(?:@\S+\s*)+/, ''));
 
     if (cmd) {
+      // 记一笔。这样 /日志 自己也留下「谁在什么时候发了什么命令」，
+      // 「我发了 /状态 怎么没反应」才查得下去。
+      logger.info(`[cmd] ${cmd} ← ${parsed.chatId}`);
       const reply = handleCommand(cmd, { chatId: parsed.chatId });
       if (reply) {
         queue.enqueue({

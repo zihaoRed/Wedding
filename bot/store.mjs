@@ -1,6 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+// config.mjs 只依赖 node 内置模块，不反向依赖这里，所以没有循环。
+import { paths } from './config.mjs';
+
 export function readJson(file, dflt) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return dflt; }
 }
@@ -14,13 +17,75 @@ export function writeJsonAtomic(file, value) {
 }
 
 const ts = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
-const emit = (level, args) => console[level](`${ts()} [${level.toUpperCase()}]`, ...args);
+
+// ── 日志：飞书的 /日志 命令要读它 ────────────────────────────────────
+//
+// 两条腿，各管一件事：
+//
+// 1. 内存缓冲（全部级别）—— 回答「机器人刚才在干嘛」。不落盘，因为 info
+//    太吵，落盘会涨得没边。
+// 2. state/errors.log（只有 warn/error）—— 回答「出过什么错」。**必须落盘**：
+//    内存缓冲重启就没了，而崩溃重启恰恰是最需要看日志的时候 —— systemd
+//    会把它拉起来，你只看到自己那条消息没回，别的什么都看不到。
+//    warn/error 很稀疏，文件长不大，超了就把前半段丢掉。
+
+const BUFFER_MAX = 400;
+const buffer = [];
+
+const ERRLOG_MAX_BYTES = 64 * 1024;
+const errLogPath = () => path.join(paths.state, 'errors.log');
+
+/** 拼成一行给人看的文本。对象要能显示，Error 要取 message 而不是 {} */
+function fmt(a) {
+  if (typeof a === 'string') return a;
+  if (a instanceof Error) return a.message;
+  try { return JSON.stringify(a); } catch { return String(a); }
+}
+
+function appendErrorLog(line) {
+  try {
+    fs.mkdirSync(paths.state, { recursive: true });
+    fs.appendFileSync(errLogPath(), `${line}\n`);
+
+    // 超了就留最后 200 行。不做按日轮转 —— 那会多出几个文件，
+    // 而这里要的只是「最近出过什么错」，翻旧账不是它的活。
+    if (fs.statSync(errLogPath()).size > ERRLOG_MAX_BYTES) {
+      const keep = fs.readFileSync(errLogPath(), 'utf8').split('\n').filter(Boolean).slice(-200);
+      fs.writeFileSync(errLogPath(), `${keep.join('\n')}\n`);
+    }
+  } catch { /* 日志写不进去不该把机器人带崩 */ }
+}
+
+const emit = (level, args) => {
+  // 控制台照旧分开传参，这样对象/SDK 的多行输出还能正常展开
+  console[level](`${ts()} [${level.toUpperCase()}]`, ...args);
+
+  const line = `${ts()} [${level.toUpperCase()}] ${args.map(fmt).join(' ')}`;
+  buffer.push(line);
+  if (buffer.length > BUFFER_MAX) buffer.shift();
+
+  if (level !== 'log') appendErrorLog(line);
+};
 
 export const logger = {
   info: (...a) => emit('log', a),
   warn: (...a) => emit('warn', a),
   error: (...a) => emit('error', a),
 };
+
+/** 内存里最近几行（所有级别）。给 /日志 用。 */
+export function recentLines(limit = 10) {
+  return buffer.slice(-limit);
+}
+
+/** 落盘的 warn/error，跨重启保留。给 /日志 用。 */
+export function recentErrors(limit = 10) {
+  try {
+    return fs.readFileSync(errLogPath(), 'utf8').split('\n').filter(Boolean).slice(-limit);
+  } catch { return []; }
+}
+
+export const logBuffered = () => buffer.length;
 
 /**
  * 单实例锁。部署期双进程会导致两个 WSClient 同时存在，而飞书的集群投递会把
