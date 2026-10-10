@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import ExcelJS from 'exceljs';
 import { paths } from './config.mjs';
+import { computeEmphasis, EMPH_COLORS, toArgb } from './emphasis.mjs';
 
 /**
  * 渲染对比产物。
@@ -37,9 +38,20 @@ export async function renderXlsx(rows, { title, outDir = paths.output }) {
   ws.getRow(1).alignment = { vertical: 'middle', wrapText: true };
   ws.getRow(1).height = 22;
 
-  for (const row of body) {
+  // 每一格该不该上色，由 emphasis.mjs 算好；这里只查表。
+  const emph = computeEmphasis(rows);
+
+  for (const [b, row] of body.entries()) {
     const r = ws.addRow(row);
     r.alignment = { vertical: 'top', wrapText: true };
+    for (let c = 0; c < row.length; c += 1) {
+      const mark = emph[b + 1]?.[c];
+      if (!mark) continue;
+      const color = EMPH_COLORS[mark];
+      const cell = ws.getCell(b + 2, c + 1);      // 第 1 行是表头，所以 +2
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: toArgb(color.bg) } };
+      cell.font = { color: { argb: toArgb(color.ink) }, bold: color.bold };
+    }
   }
 
   ws.views = [{ state: 'frozen', ySplit: 1 }];
@@ -71,12 +83,21 @@ export function renderWeb(rows, { title, subtitle = '', outDir = paths.web }) {
   const names = body.map((r) => r[0] ?? '');
   const flip = fields.length > names.length;
 
+  // 每一格该不该上色，由 emphasis.mjs 算好；这里只查表 —— xlsx 和网页共用同一份判断。
+  const emph = computeEmphasis(rows);
+  const emphAttr = (r, c) => {
+    const mark = emph[r]?.[c];
+    return mark ? ` data-emph="${mark}"` : '';
+  };
+
   // 纯数字右对齐并等宽，方便竖着扫一列比价
   const isNum = (v) => v !== undefined && v !== null && v !== ''
     && !/[^\d.,%\s]/.test(String(v));
   const td = (v) => (v === undefined || v === null || v === ''
     ? '<span class="na">—</span>'
     : esc(v));
+  // 高亮用独立的 data-emph，**不能拼进 class** ——
+  // `class="num best"` 会让既有的 `class="num"` 断言失效。
   const numAttr = (v) => (isNum(v) ? ' class="num"' : '');
 
   const head = flip
@@ -86,14 +107,37 @@ export function renderWeb(rows, { title, subtitle = '', outDir = paths.web }) {
 
   const trs = flip
     ? fields.map((f, i) => `<tr><th class="field">${esc(f)}</th>`
-        + body.map((r) => `<td${numAttr(r[i + 1])}>${td(r[i + 1])}</td>`).join('') + '</tr>').join('\n')
-    : body.map((r) => `<tr>`
+        + body.map((r, j) => `<td${numAttr(r[i + 1])}${emphAttr(j + 1, i + 1)}>${td(r[i + 1])}</td>`).join('') + '</tr>').join('\n')
+    : body.map((r, b) => `<tr>`
         + header.map((_, i) => (i === 0
           ? `<th class="corner">${td(r[0])}</th>`
-          : `<td${numAttr(r[i])}>${td(r[i])}</td>`)).join('') + '</tr>').join('\n');
+          : `<td${numAttr(r[i])}${emphAttr(b + 1, i)}>${td(r[i])}</td>`)).join('') + '</tr>').join('\n');
 
   const dense = names.length >= 4 ? ' dense' : '';
   const stamp = new Date().toLocaleString('zh-CN', { hour12: false });
+
+  // 高亮与图例色块的颜色全部来自 EMPH_COLORS，一处定义两处用。
+  //
+  // 选择器写成 .wrap td[data-emph=...]（0,2,1）压过斑马纹的
+  // tbody tr:nth-child(even) td（0,1,3）—— 不去赌源码顺序。
+  // 深色模式下必须同时给 background 和 color：--ink 在深色下是浅灰字，
+  // 只换底色会变成浅绿底配浅灰字，看不清。
+  const emphCss = ['best', 'worst'].map((kind) => {
+    const c = EMPH_COLORS[kind];
+    const weight = c.bold ? ';font-weight:700' : '';
+    return `.wrap td[data-emph=${kind}]{background:${c.bg};color:${c.ink}${weight}}\n`
+      + `  .legend .sw.${kind}{background:${c.bg};border-color:${c.ink}}\n`
+      + `  @media (prefers-color-scheme:dark){\n`
+      + `    .wrap td[data-emph=${kind}]{background:${c.darkBg};color:${c.darkInk}}\n`
+      + `    .legend .sw.${kind}{background:${c.darkBg};border-color:${c.darkInk}}\n`
+      + `  }`;
+  }).join('\n  ');
+
+  // 带颜色的格子不解释就是个谜。只在真有高亮时才出现。
+  const legend = emph.some((row) => row.some(Boolean))
+    ? '<p class="legend"><span class="sw best"></span>这一列最划算 / 最多'
+      + '<span class="sep">·</span><span class="sw worst"></span>最贵 / 最少（3 家以上才标）</p>'
+    : '';
 
   const html = `<!doctype html>
 <html lang="zh-CN">
@@ -148,6 +192,16 @@ export function renderWeb(rows, { title, subtitle = '', outDir = paths.web }) {
   tbody tr:nth-child(even) .field{background:color-mix(in srgb,var(--bg) 55%,var(--card))}
   tbody tr:last-child>*{border-bottom:none}
   .na{color:var(--muted)}
+  ${emphCss}
+  .legend{
+    max-width:1100px;margin:0 auto 10px;color:var(--muted);font-size:12px;
+    display:flex;align-items:center;flex-wrap:wrap;gap:6px;
+  }
+  .legend .sw{
+    width:12px;height:12px;border-radius:3px;display:inline-block;
+    border:1px solid transparent;
+  }
+  .legend .sep{opacity:.45;margin:0 4px}
   /* 对比对象一多，每列就窄，缩紧内边距和字号换取可读性 */
   .dense th,.dense td{padding:9px 6px;font-size:13px}
   .dense .corner,.dense .field{width:5.5em}
@@ -163,6 +217,7 @@ export function renderWeb(rows, { title, subtitle = '', outDir = paths.web }) {
 <p class="hint">${flip
     ? `${names.length} 个对比对象 × ${fields.length} 个字段`
     : `共 ${body.length} 条`}</p>
+${legend}
 <div class="wrap"><div class="scroller">
 <table class="${flip ? 'flip' : ''}${dense}">
 <thead>${head}</thead>

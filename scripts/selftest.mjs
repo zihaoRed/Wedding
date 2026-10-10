@@ -11,6 +11,7 @@ import { paths, config, ensureDirs, CATEGORIES } from '../bot/config.mjs';
 import { sniffFormat, ingestImage } from '../bot/media.mjs';
 import { parseMessage, isAllowed } from '../bot/events.mjs';
 import { renderXlsx, renderWeb } from '../bot/render.mjs';
+import { betterDirection, comparableNumber, computeEmphasis } from '../bot/emphasis.mjs';
 import { JobQueue } from '../bot/queue.mjs';
 import { writeGuard } from '../bot/agent.mjs';
 import { createRenderServer, renderToolDefinition } from '../bot/tools.mjs';
@@ -183,15 +184,172 @@ section('渲染产物');
   ok('纯数字右对齐（竖着扫一列比价）', html.includes('class="num"'));
   ok('不再是「可左右滑动」的老提示', !html.includes('可左右滑动'));
 
+  // 高亮：只在 <tbody> 里断言。整页 includes('data-emph') 是假阳性 ——
+  // 内联 <style> 里的 `td[data-emph=best]` 本身就含这段文字。
+  const cells = html.slice(html.indexOf('<tbody>'), html.indexOf('</tbody>'));
+  ok('最低价那格标了 best', /data-emph="best"/.test(cells));
+  ok('3 家以上才标 worst（用户拍板）', /data-emph="worst"/.test(cells));
+  ok('高亮没污染 class（class="num" 原样保留）',
+    cells.includes('class="num"') && !cells.includes('class="num '));
+  const vagueRow = cells.split('<tr>').find((t) => t.includes('需确认')) ?? '';
+  ok('说不清的列（需确认）整行没上色',
+    vagueRow !== '' && !vagueRow.includes('data-emph'), vagueRow.slice(0, 90));
+
   // 反向：对象多、字段少（如按商家列的预算总表）不能转置，否则列数会炸开
   const many = [['商家', '报价'], ...Array.from({ length: 8 }, (_, i) => [`商家${i}`, 1000 + i])];
   const web2 = renderWeb(many, { title: '自检-预算总表' });
   const html2 = fs.readFileSync(web2, 'utf8');
   ok('对象多、字段少时保持原样（不转置）', !html2.includes('class="flip"'));
 
+  // 非转置那条路径（emph[b+1][i]）只有这里覆盖得到
+  const cells2 = html2.slice(html2.indexOf('<tbody>'), html2.indexOf('</tbody>'));
+  ok('非转置路径也标了高亮', /data-emph="best"/.test(cells2) && /data-emph="worst"/.test(cells2));
+  ok('第一列（商家名）永不参与比较', !/<th class="corner"[^>]*data-emph/.test(cells2));
+
+  // 2 家对比：只标绿，不标红
+  const two = [['商家', '报价'], ['A家', 2999], ['B家', 3288]];
+  const web3 = renderWeb(two, { title: '自检-两家对比' });
+  const html3 = fs.readFileSync(web3, 'utf8');
+  const cells3 = html3.slice(html3.indexOf('<tbody>'), html3.indexOf('</tbody>'));
+  ok('两家对比只标绿不标红（标红等于每格都有底色）',
+    /data-emph="best"/.test(cells3) && !/data-emph="worst"/.test(cells3));
+  ok('图例解释了颜色', html3.includes('class="legend"'));
+
+  // 没有任何高亮时不该出现图例（否则是在解释一个不存在的东西）
+  const web4 = renderWeb([['商家', '备注'], ['A家', '送精修35张'], ['B家', '送精修30张']], { title: '自检-无高亮' });
+  ok('没有高亮就不出现图例', !fs.readFileSync(web4, 'utf8').includes('class="legend"'));
+
+  // 数据行缺列（Agent 手写 rows 时很容易犯）绝不能抛 ——
+  // 一次异常会让 xlsx 和网页**同时**生不出来，比标错严重得多。
+  let ragged = null;
+  try {
+    renderWeb([['商家', '报价'], ['A家']], { title: '自检-缺列' });
+    await renderXlsx([['商家', '报价'], ['A家']], { title: '自检-缺列' });
+  } catch (err) { ragged = err.message; }
+  ok('数据行缺列时两种渲染都不抛异常', ragged === null, ragged || '');
+
   fs.rmSync(xlsx, { force: true });
   fs.rmSync(web, { force: true });
   fs.rmSync(web2, { force: true });
+  fs.rmSync(web3, { force: true });
+  fs.rmSync(web4, { force: true });
+  fs.rmSync(path.join(paths.output, '自检-缺列.xlsx'), { force: true });
+}
+
+// ── 4b. 高亮：哪一列该标、哪一格不该抠 ────────────────────────────
+section('高亮 · 方向与取值');
+{
+  // 第一层：这一列参不参与。以 spec §4 的真实字段名为准（下面会拿 spec 原文核对）。
+  const LOW = ['报价', '单价', '总价', '加片单价', '定金', '额外费用',
+    '试妆费', '异地费', '早妆加价', '交付周期', '超时费',
+    '餐标（每桌）', '服务费比例', '低消', '进场费', '开瓶费'];
+  const HIGH = ['底片', '精修张数', '服装套数', '拍摄天数', '跟妆时长', '妆造次数',
+    '机位数量', '拍摄时长', '交付张数', '主持时长', '数量', '桌数'];
+  const NONE = ['id', '商家', '别名', '状态', '版本', '需确认', '来源',
+    '套餐名', '拍摄场景', '是否含跟妆', '相册相框摆台', '有效期', '尾款节点',
+    '试妆费可抵', '含妈妈妆', '含伴娘妆', '含新郎妆', '化妆品品牌', '含发型头饰', '档期',
+    '是否含摄像', '含快剪预告',
+    '含督导策划', '含彩排', '含音响灯光', '语言', '风格', '含助理DJ',
+    '名称', '分类', '购买渠道', '采购状态', '优先级', '备注',
+    '城市', '酒店', '厅名', '是否含税', '备桌', '婚房', '音响灯光', '停车'];
+
+  const expect = new Map([
+    ...LOW.map((f) => [f, 'low']), ...HIGH.map((f) => [f, 'high']), ...NONE.map((f) => [f, null]),
+  ]);
+  const wrong = [...expect].filter(([f, d]) => (betterDirection(f) ?? null) !== d);
+  ok(`${expect.size} 个真实字段的方向判断全部正确`, wrong.length === 0,
+    wrong.map(([f, d]) => `${f} 期望 ${d} 实际 ${betterDirection(f)}`).join('；'));
+
+  // 词表会漂移：Agent 改个列名就绕过了。所以拿 spec 原文来对 ——
+  // 以后往 §4 里加字段而忘了改 emphasis.mjs，这里会红。
+  const specText = fs.readFileSync(path.join(paths.root, 'spec', 'AGENT_SPEC.md'), 'utf8');
+  const sec4 = (specText.split(/^## 4\./m)[1] ?? '').split(/^## 5\./m)[0];
+  const ENUMS = ['待对比', '已定', '已淘汰', '待购', '已购', '已到货'];
+  const specFields = [...new Set(sec4.split('\n').flatMap((line) => {
+    const spans = [...line.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+    const isTableRow = line.trimStart().startsWith('|');
+    return (isTableRow ? spans.slice(0, 1) : spans)          // 表格行第一列才是字段名
+      .filter((s) => !s.includes('/') && !ENUMS.includes(s));
+  }))];
+  const uncovered = specFields.filter((f) => !expect.has(f));
+  ok(`spec §4 的 ${specFields.length} 个字段全部有归类`, specFields.length > 50 && uncovered.length === 0,
+    uncovered.join('、') || `只解析到 ${specFields.length} 个，可能是 §4 结构变了`);
+  const extra = [...expect.keys()].filter((f) => !specFields.includes(f));
+  ok('这里的字段名没有 spec 里已不存在的', extra.length === 0, extra.join('、'));
+
+  // 第二层：真实语料里抠得出 / 抠不出。每一条都来自磁盘上的真实产物。
+  const cases = [
+    // 表头点了量词，就只认那个量词
+    ['拍摄天数', '1天（拍摄周期 1 DAY）', 1, '1 DAY 里的数字不许冒充天数'],
+    ['拍摄天数', '全天（10小时）', null, '10 小时不许冒充 10 天'],
+    ['拍摄天数', '3天', 3],
+    ['交付周期', '30个工作日', 30, '「个」后面是工作日，仍然认得'],
+    ['交付周期', '约1.5个月', null, '「个月」不是量词'],
+    ['交付周期', '7天出片', 7],
+    ['桌数', '20桌', 20],
+    ['餐标（每桌）', '3888元/桌', 3888, '数字和量词之间夹了 元/'],
+    ['服装套数', '新娘2套+新郎2套（共4套）', 4, '「共」标的才是一共几套'],
+    ['服装套数', '共4套（新娘2套+新郎2套）', 4],
+    ['服装套数', '男女各5套（共10套），全场任选', 10],
+    ['服装套数', '服装造型3套（全场任选）；另写明「新娘各3套」', 3, '命中值一样就用它'],
+    ['服装套数', '新娘3套+新郎3套', 3, '不写「共」会被读成 3 而不是 6（已知局限）'],
+    // 表头没点量词
+    ['底片', '全程拍摄创作180+张保底，底片全送', 180, '「180+张」里的 + 要容错，否则整列失效'],
+    ['底片', '底片全送，保底拍摄200张以上（多拍多送）', 200],
+    ['底片', '保底拍摄底片100张；但注意事项写明「本套餐底片不赠送」——两者矛盾，待确认', null,
+      '自相矛盾的话不能拿来比大小'],
+    ['底片', '未知（图内未提内景/外景）', null],
+    ['报价', '8万', 80000],
+    ['报价', '8,999元', 8999],
+    ['报价', '1万2', null, '口语简写，不猜'],
+    ['报价', '2999（含税）', null],
+    ['报价', '3288元，2套服装', null, '两种量纲混在一格'],
+    ['低消', '低消3万，含10桌', null, '否则会把 10 桌当成低消'],
+    ['机位数量', '双机位（含1个主机位+1个游机位）', null, '复合描述，否则双机位变成单机位'],
+    ['机位数量', '2', 2],
+    ['数量', 12, 12],
+    ['数量', '共12件', 12],
+    ['服务费比例', '10%', 10],
+    ['精修张数', '精修35张（另送5张）', null],
+    // 这些列有数字，但第一层就不让它们参与。第二层自己也得挡住。
+    ['备注', '含精修35张', null],
+    ['版本', '6', null],
+    ['需确认项数', '12', null],
+    ['是否含跟妆', '含（价值800元）', null],
+    ['底片', undefined, null, '缺列不能抛'],
+  ];
+  const bad = cases.filter(([h, v, want]) => comparableNumber(v, h) !== want);
+  ok(`真实语料取值 ${cases.length} 条全部符合预期`, bad.length === 0,
+    bad.map(([h, v, want]) => `${h}「${v}」→ ${comparableNumber(v, h)}（期望 ${want}）`).join('；'));
+
+  // 整表：谁该上色
+  const e1 = computeEmphasis([
+    ['商家', '报价', '底片'], ['A家', 2999, 200], ['B家', 3288, 180], ['C家', 9280, 180],
+  ]);
+  ok('3 家：最低价标 best、最高价标 worst', e1[1][1] === 'best' && e1[3][1] === 'worst', JSON.stringify(e1));
+  ok('3 家：最多的标 best、最少的标 worst（两家并列最少都标）',
+    e1[1][2] === 'best' && e1[2][2] === 'worst' && e1[3][2] === 'worst');
+  ok('第 0 列永不参与（真实数据里有带数字的商家名）', e1.every((r) => r[0] === null));
+
+  const e2 = computeEmphasis([['商家', '报价'], ['A家', 2999], ['B家', 3288]]);
+  ok('2 家：只标 best，绝不出现 worst', e2[1][1] === 'best' && !e2.flat().includes('worst'), JSON.stringify(e2));
+
+  const e3 = computeEmphasis([['商家', '报价'], ['A家', 2999], ['B家', '未知']]);
+  ok('只剩一个已知值 → 不比（一个值没有「最」）', e3.flat().every((v) => v === null));
+
+  const e4 = computeEmphasis([['商家', '报价'], ['A家', 100], ['B家', 100], ['C家', 100]]);
+  ok('全都一样 → 不比（没有信息）', e4.flat().every((v) => v === null));
+
+  // 「合计」行必须排除，否则它在数量列永远最多、在价格列永远最贵。
+  // 注意这里要有 3 家：排除合计后只剩 2 家的话，按规则本来就只标绿。
+  const e5 = computeEmphasis([
+    ['商家', '报价'], ['A家', 2999], ['B家', 3288], ['C家', 5000], ['合计', 11287],
+  ]);
+  ok('「合计」行不参与（否则它永远是「最贵」）',
+    e5[4].every((v) => v === null) && e5[1][1] === 'best' && e5[3][1] === 'worst', JSON.stringify(e5));
+
+  const e6 = computeEmphasis([['商家', '报价'], ['A家', 2999]]);
+  ok('只有表头 + 一行时不抛异常', e6.length === 2 && e6.flat().every((v) => v === null));
 }
 
 // ── 5. 写入防线 ────────────────────────────────────────────────────
