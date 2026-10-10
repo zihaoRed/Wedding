@@ -64,11 +64,22 @@ const UNIT_IN_HEADER = new RegExp(UNITS.map(unitAlt).join('|'));
 
 const NUM = '\\d[\\d,]*(?:\\.\\d+)?';
 
-/** 数字后面（允许夹 +、货币符号、斜杠）紧跟某个量词。认得「180+张」「3888元/桌」。 */
+/**
+ * 数字后面（允许夹 +、货币符号、斜杠）紧跟某个量词。认得「180+张」「3888元/桌」。
+ *
+ * 那个可选的第二加数是为了 `32+5张` 这种**加法写法**（32 张底片 + 加送 5 张 = 37）。
+ * 少于它的话正则只能从「5张」那里起匹配，于是 45 张的那家被读成 5 张、直接标成
+ * 「精修最少」—— 真实数据（服务器上那份 20 家对比页）里就有 `32+5张`/`41+5张`，
+ * 而 32+5 和 41+5 恰好都低于 55，蒙对了；换成 `40+5张` 对 `42张` 就会标错。
+ * 而 `180+张` 的加号是「以上」不是加法，后面没有第二个数，所以仍是 180。
+ */
 function unitHits(text, unit) {
-  const re = new RegExp(`(${NUM})\\s*[+＋]?\\s*(?:元|块钱|块)?\\s*[/／]?\\s*${unitAlt(unit)}`, 'g');
+  const re = new RegExp(
+    `(${NUM})\\s*(?:[+＋]\\s*(?:(${NUM})\\s*)?)?(?:元|块钱|块)?\\s*[/／]?\\s*${unitAlt(unit)}`,
+    'g',
+  );
   const out = [];
-  for (let m = re.exec(text); m; m = re.exec(text)) out.push(toNum(m[1]));
+  for (let m = re.exec(text); m; m = re.exec(text)) out.push(addend(m));
   return out;
 }
 
@@ -76,11 +87,14 @@ function unitHits(text, unit) {
 function totalFor(text, unit) {
   const re = new RegExp(
     `(?:共|合计|总计|一共)\\s*(?:计|为|是|有)?\\s*[+＋]?\\s*(?:元|块钱|块)?\\s*(${NUM})`
-    + `\\s*[+＋]?\\s*(?:元|块钱|块)?\\s*[/／]?\\s*${unitAlt(unit)}`,
+    + `\\s*(?:[+＋]\\s*(?:(${NUM})\\s*)?)?(?:元|块钱|块)?\\s*[/／]?\\s*${unitAlt(unit)}`,
   );
   const m = re.exec(text);
-  return m ? toNum(m[1]) : null;
+  return m ? addend(m) : null;
 }
+
+/** 加法写法的两个加数相加；只有一个数时就是它本身。 */
+const addend = (m) => toNum(m[1]) + (m[2] ? toNum(m[2]) : 0);
 
 /** 整格就是一个数字（可带千分位、%、万/千、货币符号）。 */
 const BARE_RE = new RegExp(`^[¥￥]?\\s*(${NUM})\\s*([万千])?\\s*(?:元|块钱|块|%|％)?$`);
