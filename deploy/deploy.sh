@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # 把本地的备婚助手同步到 ECS 并（重）启动服务。
 #
-#   用法：  deploy/deploy.sh <user@host> [--first-time]
+#   用法：  deploy/deploy.sh <user@host> [--first-time] [--push-data]
 #
 #   第一次部署必须带 --first-time（会建目录、装依赖、装 systemd/nginx）。
-#   以后改完代码重跑一次即可，不带参数就是「同步 + 重启」。
+#   以后改完代码重跑一次即可，不带参数就是「同步代码 + 重启」。
+#
+#   默认只推代码。--push-data 才额外把本地的 state/ 与 workspace/ 数据推过去，
+#   **上线之后一般不要加** —— 服务器才是数据真相来源，推过去是拿旧盖新。
 #
 #   前提：本机能免密 ssh 到目标机器，且目标机器上已有 Node 20+。
 #   目标机器上需要 sudo 权限（装 systemd unit、nginx 配置、开目录）。
@@ -33,9 +36,13 @@ REMOTE_ROOT=/srv/wedding
 #    往生产机上装包不值得，tar 到处都有。
 #    代价：没有 --delete 语义，本地删掉的文件不会在对端跟着删。
 #    对这个项目无所谓（对端是运行环境，不是镜像）。
+# ⚠️ 这里排除掉整个 workspace/ 和 state/ —— 它们全都是**运行数据**，不是代码。
+#    上线之后服务器才是真相来源，本地那份通常是旧的；tar 按文件名覆盖，
+#    所以哪怕只带上一个 workspace/data，效果也是「把服务器上同名的商家文件
+#    换回几天前的版本」。要往对端灌数据得显式加 --push-data。
 TAR_EXCLUDES=(
   --exclude './node_modules' --exclude './.git' --exclude './.env'
-  --exclude './state' --exclude './workspace/raw' --exclude './workspace/output'
+  --exclude './state' --exclude './workspace'
   --exclude './web' --exclude '.DS_Store' --exclude '*.log'
 )
 
@@ -51,26 +58,47 @@ echo "==> 同步代码到 $HOST:$REMOTE_ROOT"
 if [[ "$FIRST_TIME" == "--first-time" ]]; then
   ssh "$HOST" "mkdir -p $REMOTE_ROOT"
 fi
-tar "${TAR_MAC_META[@]}" czf - "${TAR_EXCLUDES[@]}" -C "$LOCAL_ROOT" . \
+# ⚠️ 模式参数 `czf` 必须写在 `--no-mac-metadata` **前面**。
+#    bsdtar 解析 `--no-mac-metadata czf` 时会认不出模式，直接报
+#    「Must specify one of -c, -r, -t, -u, -x」—— 看着像权限或路径问题，
+#    其实只是参数顺序。放到后面就正常。
+#
+# ⚠️ `${TAR_MAC_META[@]+"${TAR_MAC_META[@]}"}` 这个啰嗦写法是必须的。
+#    macOS 自带 bash 3.2，在 `set -u` 下展开**空数组**会报 unbound variable，
+#    而 GNU tar 不认 --no-mac-metadata，那台机器上这个数组就正是空的。
+tar czf - ${TAR_MAC_META[@]+"${TAR_MAC_META[@]}"} "${TAR_EXCLUDES[@]}" -C "$LOCAL_ROOT" . \
   | ssh "$HOST" "tar xzf - -C $REMOTE_ROOT"
 
 # ── 状态与数据 ──────────────────────────────────────────────────────
-# 单独同步，且刻意只增不删。
 #
-# state/jobs.json 一定要带过去。它同时是「任务日志」和「飞书事件去重表」。
-# 对端如果从空的开始，而飞书又把 7 小时窗口内的老消息重推到新进程上，
-# 那些消息会被当成新消息重跑一遍 —— 重复 Agent 回合、重复写文件、重复花钱。
-ssh "$HOST" "mkdir -p $REMOTE_ROOT/state $REMOTE_ROOT/workspace"
-for f in state/jobs.json state/media-index.json; do
-  [[ -f "$LOCAL_ROOT/$f" ]] && tar "${TAR_MAC_META[@]}" czf - -C "$LOCAL_ROOT" "$f" \
-    | ssh "$HOST" "tar xzf - -C $REMOTE_ROOT"
-done
-
-echo "==> 同步 workspace 数据（Markdown 才是真相来源）"
-for d in workspace/data workspace/inbox; do
-  [[ -d "$LOCAL_ROOT/$d" ]] && tar "${TAR_MAC_META[@]}" czf - -C "$LOCAL_ROOT" "$d" \
-    | ssh "$HOST" "tar xzf - -C $REMOTE_ROOT"
-done
+# ⚠️ 默认**不推** state/ 和 workspace/ 的数据，只推代码。
+#
+# 上线之后服务器才是数据的真相来源（你在手机上发的每条消息都落在那边）。
+# 本地那份是历史副本，通常是旧的。tar 解包会按文件名覆盖，所以「顺手推一下
+# 数据」的实际效果是**用旧内容盖掉服务器上的新内容**，而且覆盖的是同名的商家
+# 文件 —— 看起来成功了，数据却退回到了几天前。这种坑不该靠人记得。
+#
+# 确实需要往对端灌数据（比如换机器、或者对端是全新的一台）时，显式加参数：
+#   deploy/deploy.sh <user@host> --first-time --push-data
+#
+if [[ "${3:-}" == "--push-data" || "${FIRST_TIME}" == "--push-data" ]]; then
+  # state/jobs.json 尤其重要：它同时是「任务日志」和「飞书事件去重表」。
+  # 对端从空的开始，而飞书又把 7 小时窗口内的老消息重推到新进程上，
+  # 那些消息会被当成新消息重跑一遍 —— 重复 Agent 回合、重复写文件、重复花钱。
+  echo "==> 推送本地状态与数据（--push-data）"
+  ssh "$HOST" "mkdir -p $REMOTE_ROOT/state $REMOTE_ROOT/workspace"
+  for f in state/jobs.json state/media-index.json; do
+    [[ -f "$LOCAL_ROOT/$f" ]] && tar czf - ${TAR_MAC_META[@]+"${TAR_MAC_META[@]}"} -C "$LOCAL_ROOT" "$f" \
+      | ssh "$HOST" "tar xzf - -C $REMOTE_ROOT"
+  done
+  for d in workspace/data workspace/inbox; do
+    [[ -d "$LOCAL_ROOT/$d" ]] && tar czf - ${TAR_MAC_META[@]+"${TAR_MAC_META[@]}"} -C "$LOCAL_ROOT" "$d" \
+      | ssh "$HOST" "tar xzf - -C $REMOTE_ROOT"
+  done
+else
+  echo "==> 跳过数据同步（服务器是数据的真相来源；要覆盖就加 --push-data）"
+  ssh "$HOST" "mkdir -p $REMOTE_ROOT/state $REMOTE_ROOT/workspace"
+fi
 
 if [[ "$FIRST_TIME" == "--first-time" ]]; then
   echo "==> 上传 .env（含密钥，单独走，不进 rsync 的批量通道）"
