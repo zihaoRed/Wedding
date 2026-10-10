@@ -146,7 +146,7 @@ const kindOf = (u) => {
 };
 
 /** 值里出现这些词就整格作废：自相矛盾的话不能拿来比大小。 */
-const ABSTAIN_VALUE = /未知|待确认|需确认|待定|矛盾|不赠送|不包含|另付|另计|另收|面议/;
+const ABSTAIN_VALUE = /未知|待确认|需确认|待定|矛盾|冲突|不一致|存疑|不赠送|不包含|另付|另计|另收|面议/;
 
 /**
  * 取出这一格的可比值。
@@ -174,6 +174,15 @@ export function comparableNumber(value, header) {
     // 否则「全天（10小时）」的 10 会冒充 10 天，把所有人比下去。
     const total = totalFor(text, unit);
     if (total !== null) return total;
+    if (unit === '套') {
+      const outfit = OUTFIT_RE.exec(text);          // 「10服10造」→ 10
+      if (outfit) return toNum(outfit[1]);
+    }
+    // 人均在前就先弃权：「男女各4套」和「共8套」不是一个单位，比大小就是错的。
+    // 必须在 unitHits 之前 —— 那种写法只命中一个数，allSame 拦不住。
+    if (perPerson(text, unit)) return null;
+    const pair = pairSum(text, unit);               // 「新娘2套+新郎2套」→ 4
+    if (pair !== null) return pair;
     const hits = unitHits(text, unit);
     if (hits.length) return allSame(hits) ? hits[0] : null;
     return bareNumber(text);
@@ -181,6 +190,37 @@ export function comparableNumber(value, header) {
 
   const bare = bareNumber(text);
   return bare !== null ? bare : fromAllTokens(text);
+}
+
+/** 「10服10造」「8服+8造」—— 婚纱照里服装套数的标准写法，取「服」前面那个数。 */
+const OUTFIT_RE = /(\d+)\s*服/;
+
+/**
+ * 同一量词的两段数字相加：「新娘2套+新郎2套」= 4 套，和「共4套」是同一件事
+ * （真实数据里两种写法都有，只有「共」那种能被 totalFor 认出来）。
+ *
+ * 只认量词重复出现，所以「服装造型3套（全场任选）；另写明「新娘各3套」」不受影响 ——
+ * 那是在复述同一个值，不是在相加。
+ */
+function pairSum(text, unit) {
+  const re = new RegExp(
+    `(${NUM})\\s*${unitAlt(unit)}\\s*[+＋]\\s*[^0-9]{0,6}(${NUM})\\s*${unitAlt(unit)}`,
+  );
+  const m = re.exec(text);
+  return m ? toNum(m[1]) + toNum(m[2]) : null;
+}
+
+const PER_PERSON = /每人|每位|单人|各/;
+
+/**
+ * 第一个数字**前面**有没有「每人 / 各」。
+ *
+ * 只看第一个数之前，是因为「服装造型3套（全场任选）；另写明「新娘各3套」」里的「各」
+ * 出现在第一个数**之后**——那是在复述，不是人均口径，得让它继续走 unitHits。
+ */
+function perPerson(text, unit) {
+  const m = new RegExp(`(${NUM})\\s*${unitAlt(unit)}`).exec(text);
+  return m ? PER_PERSON.test(text.slice(0, m.index)) : false;
 }
 
 const toNum = (s) => {
