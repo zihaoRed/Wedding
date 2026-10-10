@@ -26,7 +26,13 @@ export const logger = {
  * 单实例锁。部署期双进程会导致两个 WSClient 同时存在，而飞书的集群投递会把
  * 不同事件发给不同进程（不广播），于是两处并发写同一份 Markdown。必须拦住。
  */
-export function acquireLock(lockFile) {
+/**
+ * @param {string} lockFile
+ * @param {string} [what] 报错里怎么称呼这个进程。bot 和 watcher 共用这个函数，
+ *   而「已经有一个 bot 进程在跑」对 watcher 来说是误导 —— 装上开机自启之后，
+ *   手动跑 npm run watch 撞锁是**最常见**的报错，得让它说人话。
+ */
+export function acquireLock(lockFile, what = 'bot') {
   const stale = () => {
     const prev = readJson(lockFile, null);
     if (!prev?.pid) return true;
@@ -35,7 +41,7 @@ export function acquireLock(lockFile) {
 
   if (fs.existsSync(lockFile) && !stale()) {
     const prev = readJson(lockFile, {});
-    console.error(`[lock] 已经有一个 bot 进程在跑（pid ${prev.pid}）。` +
+    console.error(`[lock] 已经有一个 ${what} 进程在跑（pid ${prev.pid}）。` +
       `如果确认它已死，删除 ${lockFile} 后重试。`);
     process.exit(1);
   }

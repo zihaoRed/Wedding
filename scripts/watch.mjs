@@ -39,8 +39,10 @@ if (!host) {
   process.exit(1);
 }
 
-// 防止不小心开了两个 —— 两个 watcher 会同时拉、同时回执
-acquireLock(path.join(paths.state, 'watch.lock'));
+// 防止不小心开了两个 —— 两个 watcher 会同时拉、同时回执。
+// 装了开机自启（deploy/install-watch-agent.sh）之后，这条最常见的触发方式
+// 就是「launchd 起了一个，你又手动 npm run watch」，所以措辞要说准。
+acquireLock(path.join(paths.state, 'watch.lock'), 'watcher');
 
 const remote = (rel) => `${remoteRoot}/${rel}`;
 const SSH = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15'];
